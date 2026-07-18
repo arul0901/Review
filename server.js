@@ -209,6 +209,8 @@ app.post("/submit-review", upload.single("customer_image"), async (req, res) => 
         }
 
         if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
+            console.log("STORE:", process.env.SHOPIFY_STORE_DOMAIN);
+            console.log("TOKEN:", process.env.SHOPIFY_ADMIN_ACCESS_TOKEN);
             console.error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN env vars");
             return res.status(500).json({
                 success: false,
