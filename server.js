@@ -247,6 +247,81 @@ app.post("/submit-review", upload.single("customer_image"), async (req, res) => 
         });
     }
 });
+// ── Shiprocket Delivery Check ──
+let shiprocketToken = null;
+let shiprocketTokenExpiry = 0;
+
+async function getShiprocketToken() {
+    if (shiprocketToken && Date.now() < shiprocketTokenExpiry) return shiprocketToken;
+
+    const res = await fetch("https://apiv2.shiprocket.in/v1/external/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            email: SHIPROCKET_EMAIL,
+            password: SHIPROCKET_PASSWORD
+        })
+    });
+
+    const data = await res.json();
+    if (!data.token) {
+        throw new Error("Shiprocket auth failed: " + JSON.stringify(data));
+    }
+
+    shiprocketToken = data.token;
+    shiprocketTokenExpiry = Date.now() + 9 * 24 * 60 * 60 * 1000; // refresh a day early, tokens last ~10d
+    return shiprocketToken;
+}
+
+app.get("/check-delivery", async (req, res) => {
+    const { pincode, weight, cod } = req.query;
+
+    if (!/^\d{6}$/.test(pincode || "")) {
+        return res.status(400).json({ error: "Invalid pincode" });
+    }
+
+    if (!SHIPROCKET_EMAIL || !SHIPROCKET_PASSWORD || !SHIPROCKET_PICKUP_PINCODE) {
+        console.error("Missing SHIPROCKET_EMAIL / SHIPROCKET_PASSWORD / SHIPROCKET_PICKUP_PINCODE env vars");
+        return res.status(500).json({ error: "Server is not configured correctly." });
+    }
+
+    try {
+        const token = await getShiprocketToken();
+
+        const params = new URLSearchParams({
+            pickup_postcode: SHIPROCKET_PICKUP_PINCODE,
+            delivery_postcode: pincode,
+            weight: weight || "0.5",
+            cod: cod === "1" ? "1" : "0"
+        });
+
+        const srRes = await fetch(
+            `https://apiv2.shiprocket.in/v1/external/courier/serviceability/?${params}`,
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+
+        const srData = await srRes.json();
+        const couriers = srData?.data?.available_courier_companies || [];
+
+        if (!couriers.length) {
+            return res.json({ serviceable: false, message: "Delivery not available to this pincode" });
+        }
+
+        const fastest = couriers.reduce((best, c) =>
+            (!best || parseFloat(c.estimated_delivery_days) < parseFloat(best.estimated_delivery_days)) ? c : best
+        , null);
+
+        res.json({
+            serviceable: true,
+            estimated_days: fastest.estimated_delivery_days,
+            cod_available: couriers.some((c) => c.cod === 1),
+            courier: fastest.courier_name
+        });
+    } catch (err) {
+        console.error("Shiprocket check-delivery error:", err);
+        res.status(500).json({ error: "Could not check delivery right now" });
+    }
+});
 
 app.listen(process.env.PORT || 3000, () => {
     console.log("Review API listening");
