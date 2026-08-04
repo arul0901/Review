@@ -10,7 +10,10 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 *
 const {
     SHOPIFY_STORE_DOMAIN,      // e.g. "your-store.myshopify.com"
     SHOPIFY_ADMIN_ACCESS_TOKEN, // from your custom app's Admin API access token
-    SHOPIFY_API_VERSION        // e.g. "2025-01"
+    SHOPIFY_API_VERSION,       // e.g. "2025-01"
+    SHIPROCKET_EMAIL,          // Shiprocket account login email
+    SHIPROCKET_PASSWORD,       // Shiprocket account login password
+    SHIPROCKET_PICKUP_PINCODE  // pincode registered as your Shiprocket pickup address
 } = process.env;
 
 const API_VERSION = SHOPIFY_API_VERSION || "2025-01";
@@ -247,6 +250,7 @@ app.post("/submit-review", upload.single("customer_image"), async (req, res) => 
         });
     }
 });
+
 // ── Shiprocket Delivery Check ──
 let shiprocketToken = null;
 let shiprocketTokenExpiry = 0;
