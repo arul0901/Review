@@ -305,22 +305,25 @@ app.get("/check-delivery", async (req, res) => {
         );
 
         const srData = await srRes.json();
-        const couriers = srData?.data?.available_courier_companies || [];
+const couriers = srData?.data?.available_courier_companies || [];
+if (!couriers.length) {
+    return res.json({ serviceable: false, message: "Delivery not available to this pincode" });
+}
 
-        if (!couriers.length) {
-            return res.json({ serviceable: false, message: "Delivery not available to this pincode" });
-        }
+// Sort couriers by estimated delivery days (ascending)
+const sorted = [...couriers].sort(
+    (a, b) => parseFloat(a.estimated_delivery_days) - parseFloat(b.estimated_delivery_days)
+);
 
-        const fastest = couriers.reduce((best, c) =>
-            (!best || parseFloat(c.estimated_delivery_days) < parseFloat(best.estimated_delivery_days)) ? c : best
-        , null);
+// Pick 2nd earliest if available, else fall back to the earliest (only 1 courier serviceable)
+const chosen = sorted[1] || sorted[0];
 
-        res.json({
-            serviceable: true,
-            estimated_days: fastest.estimated_delivery_days,
-            cod_available: couriers.some((c) => c.cod === 1),
-            courier: fastest.courier_name
-        });
+res.json({
+    serviceable: true,
+    estimated_days: chosen.estimated_delivery_days,
+    cod_available: couriers.some((c) => c.cod === 1),
+    courier: chosen.courier_name
+});
     } catch (err) {
         console.error("Shiprocket check-delivery error:", err);
         res.status(500).json({ error: "Could not check delivery right now" });
