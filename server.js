@@ -356,7 +356,7 @@ app.listen(process.env.PORT || 3000, () => {
 //   ALLOWED_ORIGIN           Your live storefront origin, e.g. https://dawnfootwear.com
 
 const SHIPROCKET_BASE = 'https://apiv2.shiprocket.in/v1/external';
-const SHOPIFY_API_VERSION = '2025-01';
+
 
 // --- Shiprocket auth token cache -------------------------------------------------
 // Shiprocket tokens are valid ~10 days. This in-memory cache only helps within a
