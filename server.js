@@ -333,3 +333,229 @@ res.json({
 app.listen(process.env.PORT || 3000, () => {
     console.log("Review API listening");
 });
+
+// api/track-order.js
+//
+// Deploy this as a serverless function OUTSIDE your Shopify theme (Vercel, Netlify,
+// Cloudflare Workers, a small Render/Railway service — anything that can hold secret
+// environment variables and give you a public HTTPS URL). Your theme's JS calls this
+// endpoint; it never talks to Shiprocket or your Shopify Admin API directly.
+//
+// Written for Vercel's Node serverless function format:
+//   module.exports = async (req, res) => { ... }
+// Netlify/Cloudflare Workers use a slightly different handler signature — the logic
+// inside is the same, only the outer wrapper changes.
+//
+// Required environment variables (set these in your hosting provider's dashboard —
+// never commit them, never put them in the theme):
+//   SHIPROCKET_EMAIL         Shiprocket account email
+//   SHIPROCKET_PASSWORD      Shiprocket account password
+//   SHOPIFY_STORE_DOMAIN     e.g. dawnfootwear.myshopify.com
+//   SHOPIFY_ADMIN_TOKEN      Access token from a Shopify Custom App with the
+//                            `read_orders` scope (Settings > Apps > Develop apps)
+//   ALLOWED_ORIGIN           Your live storefront origin, e.g. https://dawnfootwear.com
+
+const SHIPROCKET_BASE = 'https://apiv2.shiprocket.in/v1/external';
+const SHOPIFY_API_VERSION = '2025-01';
+
+// --- Shiprocket auth token cache -------------------------------------------------
+// Shiprocket tokens are valid ~10 days. This in-memory cache only helps within a
+// warm serverless instance; for high traffic, swap this for a tiny persistent cache
+// (Upstash Redis, a KV store, etc.) so you're not re-logging-in on every cold start.
+let cachedToken = null;
+let cachedTokenExpiry = 0;
+
+async function getShiprocketToken() {
+  if (cachedToken && Date.now() < cachedTokenExpiry) return cachedToken;
+
+  const res = await fetch(`${SHIPROCKET_BASE}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: process.env.SHIPROCKET_EMAIL,
+      password: process.env.SHIPROCKET_PASSWORD,
+    }),
+  });
+
+  if (!res.ok) throw new Error('Shiprocket auth failed: ' + res.status);
+  const data = await res.json();
+  cachedToken = data.token;
+  cachedTokenExpiry = Date.now() + 9 * 24 * 60 * 60 * 1000; // refresh a day early
+  return cachedToken;
+}
+
+async function trackByAwb(awb) {
+  const token = await getShiprocketToken();
+  const res = await fetch(`${SHIPROCKET_BASE}/courier/track/awb/${encodeURIComponent(awb)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+// --- Shopify Admin GraphQL --------------------------------------------------------
+async function shopifyGraphQL(query, variables) {
+  const res = await fetch(
+    `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+      body: JSON.stringify({ query, variables }),
+    }
+  );
+  const json = await res.json();
+  if (json.errors) throw new Error('Shopify GraphQL error: ' + JSON.stringify(json.errors));
+  return json.data;
+}
+
+// Looks up a Shopify order by its order name/number (e.g. "DF102938" or "#DF102938")
+// and returns its phone number, shipping address, line items, and tracking number.
+async function findOrderByName(rawName) {
+  const cleaned = rawName.trim().replace(/^#/, '');
+  const query = `
+    query FindOrder($q: String!) {
+      orders(first: 1, query: $q) {
+        edges {
+          node {
+            name
+            phone
+            shippingAddress { address1 address2 city province zip country phone }
+            lineItems(first: 3) {
+              edges { node { title quantity variantTitle } }
+            }
+            fulfillments(first: 5) {
+              trackingInfo { number company }
+            }
+          }
+        }
+      }
+    }
+  `;
+  // Different stores format order "name" differently (custom invoice prefixes), so
+  // try with and without the leading "#".
+  for (const attempt of [`name:#${cleaned}`, `name:${cleaned}`]) {
+    const data = await shopifyGraphQL(query, { q: attempt });
+    const edge = data.orders.edges[0];
+    if (edge) return edge.node;
+  }
+  return null;
+}
+
+function normalizePhone(phone) {
+  return (phone || '').replace(/\D/g, '').slice(-10);
+}
+
+function sendJson(res, status, body) {
+  res.status(status).json(body);
+}
+
+// --- Status -> timeline stage mapping ---------------------------------------------
+// Shiprocket's `current_status` / activity text varies by courier and account.
+// This is a best-effort keyword map — log the raw response once (see below) and
+// adjust these keywords to match what your account actually returns.
+function mapStatusToStage(statusText) {
+  const s = (statusText || '').toLowerCase();
+  if (s.includes('delivered')) return 5;
+  if (s.includes('out for delivery')) return 4;
+  if (s.includes('transit') || s.includes('shipped') || s.includes('picked')) return 3;
+  if (s.includes('packed') || s.includes('ready to ship')) return 2;
+  return 1;
+}
+
+module.exports = async (req, res) => {
+  const origin = process.env.ALLOWED_ORIGIN || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' });
+
+  try {
+    const { mode, identifier, mobile } = req.body || {};
+    const enteredMobile = normalizePhone(mobile);
+
+    if (!identifier || !enteredMobile) {
+      return sendJson(res, 400, { error: 'Missing identifier or mobile number' });
+    }
+
+    let awb = null;
+    let itemName = null;
+    let itemMeta = null;
+    let address = null;
+
+    if (mode === 'awb') {
+      // AWB-only lookups aren't cross-checked against a customer phone, because
+      // Shiprocket's tracking response doesn't expose the recipient's phone number —
+      // the same trust model most carrier tracking pages use (tracking number alone
+      // is treated as the "key"). For stricter verification here too, save an
+      // AWB -> order mapping yourself (e.g. a tiny database row) at the moment
+      // Shiprocket assigns the AWB, then look it up the same way findOrderByName does.
+      awb = identifier.trim();
+    } else {
+      const order = await findOrderByName(identifier);
+      if (!order) return sendJson(res, 404, { error: 'Order not found' });
+
+      const orderPhone = normalizePhone(order.phone || order.shippingAddress?.phone);
+      if (!orderPhone || orderPhone !== enteredMobile) {
+        // Same generic error as "not found" — don't reveal which check failed.
+        return sendJson(res, 404, { error: 'Order not found' });
+      }
+
+      const tracking = order.fulfillments?.[0]?.trackingInfo?.[0];
+      if (!tracking?.number) {
+        return sendJson(res, 404, { error: 'This order has not shipped yet.' });
+      }
+      awb = tracking.number;
+
+      const line = order.lineItems?.edges?.[0]?.node;
+      if (line) {
+        itemName = line.title;
+        itemMeta = `Qty: ${line.quantity}${line.variantTitle ? ' | ' + line.variantTitle : ''}`;
+      }
+      const addr = order.shippingAddress;
+      if (addr) {
+        address = [addr.address1, addr.address2, addr.city, addr.province, addr.zip]
+          .filter(Boolean)
+          .join(', ');
+      }
+    }
+
+    const trackingResponse = await trackByAwb(awb);
+    if (!trackingResponse) return sendJson(res, 404, { error: 'Order not found' });
+
+    // --- IMPORTANT: verify this shape against your real account ------------------
+    // Temporarily uncomment the next line, redeploy, and check your function logs
+    // after a real test lookup, then adjust the field paths below to match.
+    // console.log('RAW Shiprocket response:', JSON.stringify(trackingResponse));
+
+    const data = trackingResponse.tracking_data || {};
+    const shipment = (data.shipment_track && data.shipment_track[0]) || {};
+    const activities = data.shipment_track_activities || [];
+    const statusText = shipment.current_status || data.track_status || 'In Transit';
+
+    return sendJson(res, 200, {
+      orderId: shipment.order_id || identifier,
+      awb: shipment.awb_code || awb,
+      courier: shipment.courier_name || 'Courier partner',
+      status: statusText,
+      edd: shipment.edd || null,
+      currentStage: mapStatusToStage(statusText),
+      itemName,
+      itemMeta,
+      address,
+      activities: activities.map((a) => ({
+        date: a.date,
+        status: a.status,
+        activity: a.activity,
+        location: a.location,
+      })),
+    });
+  } catch (err) {
+    console.error(err);
+    return sendJson(res, 500, { error: 'Something went wrong. Please try again.' });
+  }
+};
