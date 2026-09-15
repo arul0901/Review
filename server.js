@@ -351,7 +351,7 @@ app.listen(process.env.PORT || 3000, () => {
 //   SHIPROCKET_EMAIL         Shiprocket account email
 //   SHIPROCKET_PASSWORD      Shiprocket account password
 //   SHOPIFY_STORE_DOMAIN     e.g. dawnfootwear.myshopify.com
-//   SHOPIFY_ADMIN_TOKEN      Access token from a Shopify Custom App with the
+//   SHOPIFY_ADMIN_ACCESS_TOKEN      Access token from a Shopify Custom App with the
 //                            `read_orders` scope (Settings > Apps > Develop apps)
 //   ALLOWED_ORIGIN           Your live storefront origin, e.g. https://dawnfootwear.com
 
@@ -401,7 +401,7 @@ async function shopifyGraphQL(query, variables) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_ACCESS_TOKEN,
       },
       body: JSON.stringify({ query, variables }),
     }
