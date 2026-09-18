@@ -517,7 +517,9 @@ module.exports = async (req, res) => {
     } else {
       const order = await findOrderByName(identifier);
       if (!order) return sendJson(res, 404, { error: 'Order not found' });
-
+      const order = await findOrderByName(identifier);
+if (!order) return sendJson(res, 404, { error: 'Order not found' });
+console.log('DEBUG order:', JSON.stringify(order));
       const orderPhone = normalizePhone(order.phone || order.shippingAddress?.phone);
       if (!orderPhone || orderPhone !== enteredMobile) {
         // Same generic error as "not found" — don't reveal which check failed.
