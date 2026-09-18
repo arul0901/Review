@@ -357,7 +357,7 @@ app.listen(process.env.PORT || 3000, () => {
 
 const SHIPROCKET_BASE = 'https://apiv2.shiprocket.in/v1/external';
 
-
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-01';
 // --- Shiprocket auth token cache -------------------------------------------------
 // Shiprocket tokens are valid ~10 days. This in-memory cache only helps within a
 // warm serverless instance; for high traffic, swap this for a tiny persistent cache
