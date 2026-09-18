@@ -7,7 +7,7 @@ const multer = require("multer"); // npm install multer — parses multipart/for
 const app = express();
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
-
+ 
 const {
     SHOPIFY_STORE_DOMAIN,      // e.g. "your-store.myshopify.com"
     SHOPIFY_ADMIN_ACCESS_TOKEN, // from your custom app's Admin API access token
