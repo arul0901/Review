@@ -481,7 +481,7 @@ app.post('/track-order', async (req, res) => {
     } else {
       const order = await findOrderByName(identifier);
       if (!order) return sendJson(res, 404, { error: 'Order not found' });
-      console.log('DEBUG order:', JSON.stringify(order));
+     
 
       const orderPhone = normalizePhone(order.phone || order.shippingAddress?.phone);
       if (!orderPhone || orderPhone !== enteredMobile) {
