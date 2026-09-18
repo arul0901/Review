@@ -484,7 +484,7 @@ function mapStatusToStage(statusText) {
   return 1;
 }
 
-module.exports = async (req, res) => {
+app.post('/track-order', async (req, res) => {
   const origin = process.env.ALLOWED_ORIGIN || '*';
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -514,12 +514,10 @@ module.exports = async (req, res) => {
       // AWB -> order mapping yourself (e.g. a tiny database row) at the moment
       // Shiprocket assigns the AWB, then look it up the same way findOrderByName does.
       awb = identifier.trim();
-    } else {
+    }     } else {
       const order = await findOrderByName(identifier);
       if (!order) return sendJson(res, 404, { error: 'Order not found' });
-      const order = await findOrderByName(identifier);
-if (!order) return sendJson(res, 404, { error: 'Order not found' });
-console.log('DEBUG order:', JSON.stringify(order));
+      console.log('DEBUG order:', JSON.stringify(order));
       const orderPhone = normalizePhone(order.phone || order.shippingAddress?.phone);
       if (!orderPhone || orderPhone !== enteredMobile) {
         // Same generic error as "not found" — don't reveal which check failed.
@@ -579,4 +577,4 @@ console.log('DEBUG order:', JSON.stringify(order));
     console.error(err);
     return sendJson(res, 500, { error: 'Something went wrong. Please try again.' });
   }
-};
+});
