@@ -5,6 +5,7 @@ const cors = require("cors");
 const multer = require("multer"); // npm install multer — parses multipart/form-data (FormData + file upload)
 
 const app = express();
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 const {
@@ -26,7 +27,25 @@ const METAOBJECT_TYPE = "customer_reviews";
 
 app.use(cors());
 app.use(express.json());
+// ── Request logger (with body) ──
+app.use((req, res, next) => {
+    const start = Date.now();
+    const { method, originalUrl, body } = req;
 
+    res.on("finish", () => {
+        const ms = Date.now() - start;
+        const status = res.statusCode;
+        const marker = status >= 500 ? "🔴" : status >= 400 ? "🟡" : "🟢";
+
+        const safeBody = { ...body };
+        delete safeBody.password;
+        delete safeBody.mobile; // strip if you don't want phone numbers in logs
+
+        console.log(`${marker} ${method} ${originalUrl} ${status} - ${ms}ms`, JSON.stringify(safeBody));
+    });
+
+    next();
+});
 app.get("/", (req, res) => {
     res.send("Review API Running");
 });
