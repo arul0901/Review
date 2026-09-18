@@ -373,65 +373,49 @@ app.listen(process.env.PORT || 3000, () => {
 //   SHOPIFY_ADMIN_ACCESS_TOKEN      Access token from a Shopify Custom App with the
 //                            `read_orders` scope (Settings > Apps > Develop apps)
 //   ALLOWED_ORIGIN           Your live storefront origin, e.g. https://dawnfootwear.com
+// ── Order Tracking ──
+//
+// Same server, same env vars already loaded above (SHOPIFY_STORE_DOMAIN,
+// SHOPIFY_ADMIN_ACCESS_TOKEN, SHIPROCKET_EMAIL, SHIPROCKET_PASSWORD).
+// Frontend calls POST /track-order with { mode: 'awb' | 'orderid', identifier, mobile }.
 
 const SHIPROCKET_BASE = 'https://apiv2.shiprocket.in/v1/external';
 
-
-// --- Shiprocket auth token cache -------------------------------------------------
-// Shiprocket tokens are valid ~10 days. This in-memory cache only helps within a
-// warm serverless instance; for high traffic, swap this for a tiny persistent cache
-// (Upstash Redis, a KV store, etc.) so you're not re-logging-in on every cold start.
 let cachedToken = null;
 let cachedTokenExpiry = 0;
 
-async function getShiprocketToken() {
+async function getShiprocketTokenForTracking() {
   if (cachedToken && Date.now() < cachedTokenExpiry) return cachedToken;
 
   const res = await fetch(`${SHIPROCKET_BASE}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      email: process.env.SHIPROCKET_EMAIL,
-      password: process.env.SHIPROCKET_PASSWORD,
+      email: SHIPROCKET_EMAIL,
+      password: SHIPROCKET_PASSWORD,
     }),
   });
 
   if (!res.ok) throw new Error('Shiprocket auth failed: ' + res.status);
   const data = await res.json();
   cachedToken = data.token;
-  cachedTokenExpiry = Date.now() + 9 * 24 * 60 * 60 * 1000; // refresh a day early
+  cachedTokenExpiry = Date.now() + 9 * 24 * 60 * 60 * 1000;
   return cachedToken;
 }
 
 async function trackByAwb(awb) {
-  const token = await getShiprocketToken();
+  const token = await getShiprocketTokenForTracking();
   const res = await fetch(`${SHIPROCKET_BASE}/courier/track/awb/${encodeURIComponent(awb)}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    console.error('Shiprocket track failed:', res.status, body);
+    return null;
+  }
   return res.json();
 }
 
-// --- Shopify Admin GraphQL --------------------------------------------------------
-async function shopifyGraphQL(query, variables) {
-  const res = await fetch(
-    `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_ACCESS_TOKEN,
-      },
-      body: JSON.stringify({ query, variables }),
-    }
-  );
-  const json = await res.json();
-  if (json.errors) throw new Error('Shopify GraphQL error: ' + JSON.stringify(json.errors));
-  return json.data;
-}
-
-// Looks up a Shopify order by its order name/number (e.g. "DF102938" or "#DF102938")
-// and returns its phone number, shipping address, line items, and tracking number.
 async function findOrderByName(rawName) {
   const cleaned = rawName.trim().replace(/^#/, '');
   const query = `
@@ -453,10 +437,8 @@ async function findOrderByName(rawName) {
       }
     }
   `;
-  // Different stores format order "name" differently (custom invoice prefixes), so
-  // try with and without the leading "#".
   for (const attempt of [`name:#${cleaned}`, `name:${cleaned}`]) {
-    const data = await shopifyGraphQL(query, { q: attempt });
+    const data = await shopifyAdminGraphQL(query, { q: attempt });
     const edge = data.orders.edges[0];
     if (edge) return edge.node;
   }
@@ -471,10 +453,6 @@ function sendJson(res, status, body) {
   res.status(status).json(body);
 }
 
-// --- Status -> timeline stage mapping ---------------------------------------------
-// Shiprocket's `current_status` / activity text varies by courier and account.
-// This is a best-effort keyword map — log the raw response once (see below) and
-// adjust these keywords to match what your account actually returns.
 function mapStatusToStage(statusText) {
   const s = (statusText || '').toLowerCase();
   if (s.includes('delivered')) return 5;
@@ -485,14 +463,6 @@ function mapStatusToStage(statusText) {
 }
 
 app.post('/track-order', async (req, res) => {
-  const origin = process.env.ALLOWED_ORIGIN || '*';
-  res.setHeader('Access-Control-Allow-Origin', origin);
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' });
-
   try {
     const { mode, identifier, mobile } = req.body || {};
     const enteredMobile = normalizePhone(mobile);
@@ -507,20 +477,14 @@ app.post('/track-order', async (req, res) => {
     let address = null;
 
     if (mode === 'awb') {
-      // AWB-only lookups aren't cross-checked against a customer phone, because
-      // Shiprocket's tracking response doesn't expose the recipient's phone number —
-      // the same trust model most carrier tracking pages use (tracking number alone
-      // is treated as the "key"). For stricter verification here too, save an
-      // AWB -> order mapping yourself (e.g. a tiny database row) at the moment
-      // Shiprocket assigns the AWB, then look it up the same way findOrderByName does.
       awb = identifier.trim();
-    }     } else {
+    } else {
       const order = await findOrderByName(identifier);
       if (!order) return sendJson(res, 404, { error: 'Order not found' });
       console.log('DEBUG order:', JSON.stringify(order));
+
       const orderPhone = normalizePhone(order.phone || order.shippingAddress?.phone);
       if (!orderPhone || orderPhone !== enteredMobile) {
-        // Same generic error as "not found" — don't reveal which check failed.
         return sendJson(res, 404, { error: 'Order not found' });
       }
 
@@ -545,11 +509,6 @@ app.post('/track-order', async (req, res) => {
 
     const trackingResponse = await trackByAwb(awb);
     if (!trackingResponse) return sendJson(res, 404, { error: 'Order not found' });
-
-    // --- IMPORTANT: verify this shape against your real account ------------------
-    // Temporarily uncomment the next line, redeploy, and check your function logs
-    // after a real test lookup, then adjust the field paths below to match.
-    // console.log('RAW Shiprocket response:', JSON.stringify(trackingResponse));
 
     const data = trackingResponse.tracking_data || {};
     const shipment = (data.shipment_track && data.shipment_track[0]) || {};
