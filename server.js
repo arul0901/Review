@@ -378,6 +378,7 @@ app.listen(process.env.PORT || 3000, () => {
 // Same server, same env vars already loaded above (SHOPIFY_STORE_DOMAIN,
 // SHOPIFY_ADMIN_ACCESS_TOKEN, SHIPROCKET_EMAIL, SHIPROCKET_PASSWORD).
 // Frontend calls POST /track-order with { mode: 'awb' | 'orderid', identifier, mobile }.
+// ── Order Tracking ──
 
 const SHIPROCKET_BASE = 'https://apiv2.shiprocket.in/v1/external';
 
@@ -445,6 +446,56 @@ async function findOrderByName(rawName) {
   return null;
 }
 
+/**
+ * Scans recent orders to find the one containing a given AWB in its
+ * fulfillment tracking info, so AWB-mode lookups can be verified against
+ * the order's phone number too (not just trusted on tracking number alone).
+ * Scans up to 300 most recent orders (3 pages of 100).
+ */
+async function findOrderByAwb(awb) {
+  const query = `
+    query FindOrderByAwb($cursor: String) {
+      orders(first: 100, after: $cursor, sortKey: CREATED_AT, reverse: true) {
+        edges {
+          cursor
+          node {
+            name
+            phone
+            shippingAddress { address1 address2 city province zip country phone }
+            lineItems(first: 3) {
+              edges { node { title quantity variantTitle } }
+            }
+            fulfillments(first: 5) {
+              trackingInfo { number company }
+            }
+          }
+        }
+        pageInfo { hasNextPage }
+      }
+    }
+  `;
+
+  let cursor = null;
+  const maxPages = 3;
+
+  for (let page = 0; page < maxPages; page++) {
+    const data = await shopifyAdminGraphQL(query, { cursor });
+    const edges = data.orders.edges;
+
+    const match = edges.find((e) =>
+      e.node.fulfillments.some((f) =>
+        f.trackingInfo.some((t) => t.number === awb)
+      )
+    );
+    if (match) return match.node;
+
+    if (!data.orders.pageInfo.hasNextPage) break;
+    cursor = edges[edges.length - 1].cursor;
+  }
+
+  return null;
+}
+
 function normalizePhone(phone) {
   return (phone || '').replace(/\D/g, '').slice(-10);
 }
@@ -458,7 +509,7 @@ function mapStatusToStage(statusText) {
   if (s.includes('delivered')) return 5;
   if (s.includes('out for delivery')) return 4;
   if (s.includes('transit') || s.includes('shipped') || s.includes('picked')) return 3;
-  if (s.includes('packed') || s.includes('ready to ship')) return 2;
+  if (s.includes('packed') || s.includes('ready to ship') || s.includes('pickup generated')) return 2;
   return 1;
 }
 
@@ -478,10 +529,32 @@ app.post('/track-order', async (req, res) => {
 
     if (mode === 'awb') {
       awb = identifier.trim();
+
+      const order = await findOrderByAwb(awb);
+      if (order) {
+        const orderPhone = normalizePhone(order.phone || order.shippingAddress?.phone);
+        if (!orderPhone || orderPhone !== enteredMobile) {
+          return sendJson(res, 404, { error: 'Order not found' });
+        }
+
+        const line = order.lineItems?.edges?.[0]?.node;
+        if (line) {
+          itemName = line.title;
+          itemMeta = `Qty: ${line.quantity}${line.variantTitle ? ' | ' + line.variantTitle : ''}`;
+        }
+        const addr = order.shippingAddress;
+        if (addr) {
+          address = [addr.address1, addr.address2, addr.city, addr.province, addr.zip]
+            .filter(Boolean)
+            .join(', ');
+        }
+      }
+      // If no matching Shopify order is found for this AWB (e.g. older than the
+      // scanned window), we still attempt the Shiprocket lookup below, just
+      // without item/address enrichment and without a phone cross-check.
     } else {
       const order = await findOrderByName(identifier);
       if (!order) return sendJson(res, 404, { error: 'Order not found' });
-     
 
       const orderPhone = normalizePhone(order.phone || order.shippingAddress?.phone);
       if (!orderPhone || orderPhone !== enteredMobile) {
@@ -536,4 +609,8 @@ app.post('/track-order', async (req, res) => {
     console.error(err);
     return sendJson(res, 500, { error: 'Something went wrong. Please try again.' });
   }
+});
+
+app.listen(process.env.PORT || 3000, () => {
+    console.log("Review API listening");
 });
