@@ -349,9 +349,7 @@ res.json({
     }
 });
 
-app.listen(process.env.PORT || 3000, () => {
-    console.log("Review API listening");
-});
+
 
 // api/track-order.js
 //
