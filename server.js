@@ -610,6 +610,7 @@ app.post('/track-order', async (req, res) => {
   }
 });
 // ── Wishlist sync (Shopify App Proxy) ──
+// ── Wishlist sync (Shopify App Proxy) ──
 function verifyProxy(req, res, next) {
     const { signature, ...rest } = req.query;
     const msg = Object.keys(rest).sort().map(k => `${k}=${[].concat(rest[k]).join(",")}`).join("");
@@ -627,8 +628,6 @@ function verifyProxy(req, res, next) {
 }
 
 app.get("/wishlist", verifyProxy, async (req, res) => {
- 
-    app.get("/wishlist", verifyProxy, async (req, res) => {
     try {
         res.set("Cache-Control", "no-store");
         const data = await shopifyAdminGraphQL(
@@ -645,8 +644,8 @@ app.get("/wishlist", verifyProxy, async (req, res) => {
 app.post("/wishlist", verifyProxy, async (req, res) => {
     try {
         const items = (Array.isArray(req.body.items) ? req.body.items : [])
-    .filter((p, i, a) => p && p.handle && a.findIndex(x => x.handle === p.handle) === i)
-    .slice(0, 200);
+            .filter((p, i, a) => p && p.handle && a.findIndex(x => x.handle === p.handle) === i)
+            .slice(0, 200);
         const data = await shopifyAdminGraphQL(
             `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }`,
             { m: [{ ownerId: req.customerGid, namespace: "custom", key: "wishlist", type: "json", value: JSON.stringify(items) }] }
@@ -659,7 +658,6 @@ app.post("/wishlist", verifyProxy, async (req, res) => {
         res.status(500).json({ error: "Could not save wishlist" });
     }
 });
-
 app.listen(process.env.PORT || 3000, () => {
     console.log("Review API listening");
 });
