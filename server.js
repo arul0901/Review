@@ -3,7 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer"); // npm install multer — parses multipart/form-data (FormData + file upload)
-
+const crypto = require("crypto");
 const app = express();
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -607,6 +607,51 @@ app.post('/track-order', async (req, res) => {
     console.error(err);
     return sendJson(res, 500, { error: 'Something went wrong. Please try again.' });
   }
+});
+// ── Wishlist sync (Shopify App Proxy) ──
+function verifyProxy(req, res, next) {
+    const { signature, ...rest } = req.query;
+    const msg = Object.keys(rest).sort().map(k => `${k}=${[].concat(rest[k]).join(",")}`).join("");
+    const digest = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(msg).digest("hex");
+
+    if (!signature || signature.length !== digest.length ||
+        !crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature))) {
+        return res.status(401).end();
+    }
+    if (!rest.logged_in_customer_id) {
+        return res.status(401).json({ error: "not logged in" });
+    }
+    req.customerGid = `gid://shopify/Customer/${rest.logged_in_customer_id}`;
+    next();
+}
+
+app.get("/wishlist", verifyProxy, async (req, res) => {
+    try {
+        const data = await shopifyAdminGraphQL(
+            `query($id: ID!) { customer(id: $id) { metafield(namespace: "custom", key: "wishlist") { value } } }`,
+            { id: req.customerGid }
+        );
+        res.json({ items: JSON.parse(data.customer?.metafield?.value || "[]") });
+    } catch (err) {
+        console.error("Wishlist GET error:", err);
+        res.status(500).json({ error: "Could not load wishlist" });
+    }
+});
+
+app.post("/wishlist", verifyProxy, async (req, res) => {
+    try {
+        const items = [...new Set(Array.isArray(req.body.items) ? req.body.items : [])].slice(0, 200);
+        const data = await shopifyAdminGraphQL(
+            `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }`,
+            { m: [{ ownerId: req.customerGid, namespace: "custom", key: "wishlist", type: "json", value: JSON.stringify(items) }] }
+        );
+        const errs = data.metafieldsSet.userErrors;
+        if (errs && errs.length) throw new Error(JSON.stringify(errs));
+        res.json({ items });
+    } catch (err) {
+        console.error("Wishlist POST error:", err);
+        res.status(500).json({ error: "Could not save wishlist" });
+    }
 });
 
 app.listen(process.env.PORT || 3000, () => {
