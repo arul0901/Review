@@ -640,7 +640,9 @@ app.get("/wishlist", verifyProxy, async (req, res) => {
 
 app.post("/wishlist", verifyProxy, async (req, res) => {
     try {
-        const items = [...new Set(Array.isArray(req.body.items) ? req.body.items : [])].slice(0, 200);
+        const items = (Array.isArray(req.body.items) ? req.body.items : [])
+    .filter((p, i, a) => p && p.handle && a.findIndex(x => x.handle === p.handle) === i)
+    .slice(0, 200);
         const data = await shopifyAdminGraphQL(
             `mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }`,
             { m: [{ ownerId: req.customerGid, namespace: "custom", key: "wishlist", type: "json", value: JSON.stringify(items) }] }
