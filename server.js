@@ -615,7 +615,7 @@ function verifyProxy(req, res, next) {
     const { signature, ...rest } = req.query;
     const msg = Object.keys(rest).sort().map(k => `${k}=${[].concat(rest[k]).join(",")}`).join("");
     const digest = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(msg).digest("hex");
-    console.log("proxy customer:", rest.logged_in_customer_id);
+    // console.log("proxy customer:", rest.logged_in_customer_id);
     if (!signature || signature.length !== digest.length ||
         !crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature))) {
         return res.status(401).end();
