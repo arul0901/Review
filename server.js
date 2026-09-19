@@ -14,7 +14,7 @@ const {
     SHOPIFY_API_VERSION,       // e.g. "2025-01"
     SHIPROCKET_EMAIL,          // Shiprocket account login email
     SHIPROCKET_PASSWORD,       // Shiprocket account login password
-    SHIPROCKET_PICKUP_PINCODE  // pincode registered as your Shiprocket pickup address
+    SHIPROCKET_PICKUP_PINCODE,  // pincode registered as your Shiprocket pickup address
     SHOPIFY_API_SECRET 
 } = process.env;
 
