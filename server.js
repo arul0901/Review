@@ -15,6 +15,7 @@ const {
     SHIPROCKET_EMAIL,          // Shiprocket account login email
     SHIPROCKET_PASSWORD,       // Shiprocket account login password
     SHIPROCKET_PICKUP_PINCODE  // pincode registered as your Shiprocket pickup address
+    SHOPIFY_API_SECRET 
 } = process.env;
 
 const API_VERSION = SHOPIFY_API_VERSION || "2025-01";
@@ -626,13 +627,15 @@ function verifyProxy(req, res, next) {
 }
 
 app.get("/wishlist", verifyProxy, async (req, res) => {
+ 
     try {
         const data = await shopifyAdminGraphQL(
             `query($id: ID!) { customer(id: $id) { metafield(namespace: "custom", key: "wishlist") { value } } }`,
             { id: req.customerGid }
         );
         res.json({ items: JSON.parse(data.customer?.metafield?.value || "[]") });
-    } catch (err) {
+    }res.set("Cache-Control", "no-store");
+    catch (err) {
         console.error("Wishlist GET error:", err);
         res.status(500).json({ error: "Could not load wishlist" });
     }
