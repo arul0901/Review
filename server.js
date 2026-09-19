@@ -628,14 +628,15 @@ function verifyProxy(req, res, next) {
 
 app.get("/wishlist", verifyProxy, async (req, res) => {
  
+    app.get("/wishlist", verifyProxy, async (req, res) => {
     try {
+        res.set("Cache-Control", "no-store");
         const data = await shopifyAdminGraphQL(
             `query($id: ID!) { customer(id: $id) { metafield(namespace: "custom", key: "wishlist") { value } } }`,
             { id: req.customerGid }
         );
         res.json({ items: JSON.parse(data.customer?.metafield?.value || "[]") });
-    }res.set("Cache-Control", "no-store");
-    catch (err) {
+    } catch (err) {
         console.error("Wishlist GET error:", err);
         res.status(500).json({ error: "Could not load wishlist" });
     }
