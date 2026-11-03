@@ -5,6 +5,7 @@ const cors = require("cors");
 const multer = require("multer"); // npm install multer — parses multipart/form-data (FormData + file upload)
 const crypto = require("crypto");
 const app = express();
+app.set("trust proxy", 1);
 
 // ── Review media upload limits ──
 // Hard server-side caps. The storefront section has its own (lower) settings;
@@ -87,9 +88,10 @@ app.use(express.json());
 // ── Request logger (with body) ──
 app.use((req, res, next) => {
     const start = Date.now();
-    const { method, originalUrl, body } = req;
+    const { method, originalUrl } = req;
 
     res.on("finish", () => {
+        const body = req.body;
         const ms = Date.now() - start;
         const status = res.statusCode;
         const marker = status >= 500 ? "🔴" : status >= 400 ? "🟡" : "🟢";
@@ -225,38 +227,68 @@ async function uploadMediaToShopifyFiles(file) {
     return fileData.fileCreate.files[0].id; // e.g. "gid://shopify/MediaImage/12345" or ".../Video/12345"
 }
 
+// ── Direct browser -> Shopify upload bookkeeping ──
+// The browser asks /review-upload-targets for staged upload targets, uploads
+// the files straight to Shopify, then sends only upload IDs to /submit-review.
+// We remember which resourceUrl each ID maps to, so a client can never make
+// us register an arbitrary URL as a Shopify file.
+const PENDING_TTL_MS = 60 * 60 * 1000; // an upload ID is valid for 1 hour
+const pendingUploads = new Map(); // uploadId -> { resourceUrl, isVideo, expires }
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, p] of pendingUploads) {
+        if (p.expires < now) pendingUploads.delete(id);
+    }
+}, 10 * 60 * 1000).unref();
+
+// Tiny in-memory rate limit for asking for upload targets (per IP, per hour)
+const targetHits = new Map();
+function allowTargetRequest(ip) {
+    const now = Date.now();
+    const windowMs = 60 * 60 * 1000;
+    const limit = 20;
+    const hits = (targetHits.get(ip) || []).filter((t) => now - t < windowMs);
+    if (hits.length >= limit) {
+        targetHits.set(ip, hits);
+        return false;
+    }
+    hits.push(now);
+    targetHits.set(ip, hits);
+    return true;
+}
+
+const mb = (bytes) => Math.round(bytes / 1024 / 1024);
+
 /**
- * Videos (and large images) are processed asynchronously by Shopify. Wait
- * briefly for the files to become READY before linking them to the review.
- * If they are still processing after the timeout, we carry on anyway:
- * Shopify finishes processing in the background and the files appear once ready.
+ * Registers files that the browser already uploaded to Shopify's staged
+ * storage as real Shopify Files, in one call. Returns their GIDs in order.
+ * Videos keep processing in the background; we deliberately don't wait,
+ * since the review stays unpublished until you approve it.
  */
-async function waitForFilesReady(fileGids, timeoutMs = 45000) {
-    const query = `
-    query FileStatuses($ids: [ID!]!) {
-      nodes(ids: $ids) {
-        ... on File { id fileStatus }
+async function registerShopifyFiles(items) {
+    const mutation = `
+    mutation fileCreate($files: [FileCreateInput!]!) {
+      fileCreate(files: $files) {
+        files { id fileStatus }
+        userErrors { field message }
       }
     }
   `;
 
-    const deadline = Date.now() + timeoutMs;
+    const data = await shopifyAdminGraphQL(mutation, {
+        files: items.map((item) => ({
+            originalSource: item.resourceUrl,
+            contentType: item.isVideo ? "VIDEO" : "IMAGE"
+        }))
+    });
 
-    while (Date.now() < deadline) {
-        const data = await shopifyAdminGraphQL(query, { ids: fileGids });
-        const nodes = (data.nodes || []).filter(Boolean);
-
-        if (nodes.some((n) => n.fileStatus === "FAILED")) {
-            throw new Error("A review file failed processing in Shopify.");
-        }
-        if (nodes.length === fileGids.length && nodes.every((n) => n.fileStatus === "READY")) {
-            return;
-        }
-
-        await sleep(2000);
+    const errors = data.fileCreate.userErrors;
+    if (errors && errors.length) {
+        throw new Error("fileCreate error: " + JSON.stringify(errors));
     }
 
-    console.warn("Review files still processing after wait; continuing anyway:", fileGids);
+    return data.fileCreate.files.map((f) => f.id);
 }
 
 /**
@@ -314,6 +346,109 @@ async function createReviewMetaobject({
     return data.metaobjectCreate.metaobject;
 }
 
+/**
+ * Step 1 of a review with photos/videos: the browser tells us what it wants to
+ * upload; we ask Shopify for upload targets and hand them back. No file bytes
+ * ever pass through this server.
+ */
+app.post("/review-upload-targets", async (req, res) => {
+    try {
+        if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
+            console.error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN env vars");
+            return res.status(500).json({ success: false, message: "Server is not configured correctly." });
+        }
+
+        if (!allowTargetRequest(req.ip)) {
+            return res.status(429).json({ success: false, message: "Too many uploads. Please try again later." });
+        }
+
+        const list = Array.isArray(req.body && req.body.files) ? req.body.files : [];
+        if (!list.length || list.length > MAX_REVIEW_FILES) {
+            return res.status(400).json({
+                success: false,
+                message: `Attach between 1 and ${MAX_REVIEW_FILES} files.`
+            });
+        }
+
+        const input = [];
+        for (const f of list) {
+            const mimeType = String((f && f.mimeType) || "");
+            const size = Number(f && f.size);
+            const isVideo = mimeType.startsWith("video/");
+            const isImage = mimeType.startsWith("image/");
+
+            if (!isVideo && !isImage) {
+                return res.status(400).json({ success: false, message: "Only photos and videos can be attached." });
+            }
+            if (!Number.isFinite(size) || size <= 0) {
+                return res.status(400).json({ success: false, message: "Invalid file size." });
+            }
+            if (isImage && size > MAX_IMAGE_BYTES) {
+                return res.status(413).json({ success: false, message: `Photos can be up to ${mb(MAX_IMAGE_BYTES)}MB.` });
+            }
+            if (isVideo && size > MAX_VIDEO_BYTES) {
+                return res.status(413).json({ success: false, message: `Videos can be up to ${mb(MAX_VIDEO_BYTES)}MB.` });
+            }
+
+            const filename = String((f && f.filename) || "upload").replace(/[^\w.\-]+/g, "_").slice(-80) || "upload";
+
+            input.push({
+                filename,
+                mimeType,
+                httpMethod: "POST",
+                resource: isVideo ? "VIDEO" : "FILE",
+                fileSize: String(Math.round(size))
+            });
+        }
+
+        const stagedQuery = `
+        mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+          stagedUploadsCreate(input: $input) {
+            stagedTargets {
+              url
+              resourceUrl
+              parameters { name value }
+            }
+            userErrors { field message }
+          }
+        }
+      `;
+
+        const data = await shopifyAdminGraphQL(stagedQuery, { input });
+
+        const errors = data.stagedUploadsCreate.userErrors;
+        if (errors && errors.length) {
+            throw new Error("stagedUploadsCreate error: " + JSON.stringify(errors));
+        }
+
+        const targets = data.stagedUploadsCreate.stagedTargets;
+        if (!targets || targets.length !== input.length) {
+            throw new Error("stagedUploadsCreate returned an unexpected number of targets");
+        }
+
+        const expires = Date.now() + PENDING_TTL_MS;
+        const out = targets.map((t, i) => {
+            const uploadId = crypto.randomUUID();
+            pendingUploads.set(uploadId, {
+                resourceUrl: t.resourceUrl,
+                isVideo: input[i].resource === "VIDEO",
+                expires
+            });
+            return { uploadId, url: t.url, parameters: t.parameters };
+        });
+
+        res.json({ success: true, targets: out });
+    } catch (err) {
+        console.error("review-upload-targets error:", err);
+        res.status(500).json({ success: false, message: "Could not start the upload. Please try again." });
+    }
+});
+
+/**
+ * Step 2 (or the only step, if there are no files): create the review.
+ * Accepts JSON { product_id, customer_name, location, rating, review_text, upload_ids[] }.
+ * The old multipart form (files sent through this server) still works as a fallback.
+ */
 app.post("/submit-review", handleReviewUpload, async (req, res) => {
     try {
         const { product_id, customer_name, location, rating, review_text } = req.body;
@@ -341,38 +476,58 @@ app.post("/submit-review", handleReviewUpload, async (req, res) => {
             });
         }
 
-        // Collect photos + videos (new field first, legacy single image after)
-        const uploaded = req.files || {};
-        const files = [...(uploaded.review_media || []), ...(uploaded.customer_image || [])];
+        // Files uploaded directly to Shopify (new flow)
+        const rawIds = Array.isArray(req.body.upload_ids) ? req.body.upload_ids : [];
+        const uploadIds = [...new Set(rawIds.map(String))];
 
-        if (files.length > MAX_REVIEW_FILES) {
+        // Files sent through this server (legacy multipart flow)
+        const uploaded = req.files || {};
+        const legacyFiles = [...(uploaded.review_media || []), ...(uploaded.customer_image || [])];
+
+        if (uploadIds.length + legacyFiles.length > MAX_REVIEW_FILES) {
             return res.status(400).json({
                 success: false,
                 message: `Too many files. You can attach up to ${MAX_REVIEW_FILES}.`
             });
         }
 
-        // Per-type size limits (multer only enforces the larger video cap)
-        for (const file of files) {
+        for (const file of legacyFiles) {
             if (file.mimetype.startsWith("image/") && file.size > MAX_IMAGE_BYTES) {
                 return res.status(413).json({
                     success: false,
-                    message: `"${file.originalname}" is too large. Photos can be up to ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB.`
+                    message: `"${file.originalname}" is too large. Photos can be up to ${mb(MAX_IMAGE_BYTES)}MB.`
                 });
             }
             if (file.mimetype.startsWith("video/") && file.size > MAX_VIDEO_BYTES) {
                 return res.status(413).json({
                     success: false,
-                    message: `"${file.originalname}" is too large. Videos can be up to ${Math.round(MAX_VIDEO_BYTES / 1024 / 1024)}MB.`
+                    message: `"${file.originalname}" is too large. Videos can be up to ${mb(MAX_VIDEO_BYTES)}MB.`
                 });
             }
         }
 
+        const pending = [];
+        for (const id of uploadIds) {
+            const entry = pendingUploads.get(id);
+            if (!entry || entry.expires < Date.now()) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Your upload expired. Please attach your files again."
+                });
+            }
+            pending.push(entry);
+        }
+
         let mediaFileGids = [];
-        if (files.length) {
-            // Upload in parallel; Promise.all keeps the original order.
-            mediaFileGids = await Promise.all(files.map(uploadMediaToShopifyFiles));
-            await waitForFilesReady(mediaFileGids);
+
+        if (pending.length) {
+            mediaFileGids = await registerShopifyFiles(pending);
+            uploadIds.forEach((id) => pendingUploads.delete(id)); // single use
+        }
+
+        if (legacyFiles.length) {
+            const legacyGids = await Promise.all(legacyFiles.map(uploadMediaToShopifyFiles));
+            mediaFileGids.push(...legacyGids);
         }
 
         const metaobject = await createReviewMetaobject({
