@@ -6,8 +6,64 @@ const multer = require("multer"); // npm install multer — parses multipart/for
 const crypto = require("crypto");
 const app = express();
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
- 
+// ── Review media upload limits ──
+// Hard server-side caps. The storefront section has its own (lower) settings;
+// keep these at or above those. Override on Render with MAX_IMAGE_MB / MAX_VIDEO_MB.
+// NOTE: files are held in memory while uploading, so keep MAX_VIDEO_MB modest
+// on small Render instances (a few large videos at once can exhaust RAM).
+const MAX_REVIEW_FILES = 10;
+const MAX_IMAGE_BYTES = (Number(process.env.MAX_IMAGE_MB) || 20) * 1024 * 1024;
+const MAX_VIDEO_BYTES = (Number(process.env.MAX_VIDEO_MB) || 50) * 1024 * 1024;
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_VIDEO_BYTES, files: MAX_REVIEW_FILES + 1 },
+    fileFilter: (req, file, cb) => {
+        if (/^(image|video)\//.test(file.mimetype)) return cb(null, true);
+        cb(new Error("INVALID_FILE_TYPE"));
+    }
+});
+
+// New storefront sends everything as "review_media" (photos + videos).
+// "customer_image" is still accepted so a cached older theme keeps working.
+const reviewUpload = upload.fields([
+    { name: "review_media", maxCount: MAX_REVIEW_FILES },
+    { name: "customer_image", maxCount: 1 }
+]);
+
+// Wraps multer so upload problems come back as clean JSON the storefront can show.
+function handleReviewUpload(req, res, next) {
+    reviewUpload(req, res, (err) => {
+        if (!err) return next();
+
+        if (err instanceof multer.MulterError) {
+            if (err.code === "LIMIT_FILE_SIZE") {
+                return res.status(413).json({
+                    success: false,
+                    message: "One of your files is too large. Try smaller photos or videos."
+                });
+            }
+            return res.status(400).json({
+                success: false,
+                message: `Too many files. You can attach up to ${MAX_REVIEW_FILES}.`
+            });
+        }
+
+        if (err.message === "INVALID_FILE_TYPE") {
+            return res.status(400).json({
+                success: false,
+                message: "Only photos and videos can be attached."
+            });
+        }
+
+        console.error("Upload middleware error:", err);
+        return res.status(500).json({
+            success: false,
+            message: "Something went wrong while uploading your files."
+        });
+    });
+}
+
 const {
     SHOPIFY_STORE_DOMAIN,      // e.g. "your-store.myshopify.com"
     SHOPIFY_ADMIN_ACCESS_TOKEN, // from your custom app's Admin API access token
@@ -15,7 +71,7 @@ const {
     SHIPROCKET_EMAIL,          // Shiprocket account login email
     SHIPROCKET_PASSWORD,       // Shiprocket account login password
     SHIPROCKET_PICKUP_PINCODE,  // pincode registered as your Shiprocket pickup address
-    SHOPIFY_API_SECRET 
+    SHOPIFY_API_SECRET
 } = process.env;
 
 const API_VERSION = SHOPIFY_API_VERSION || "2025-01";
@@ -75,14 +131,20 @@ async function shopifyAdminGraphQL(query, variables) {
     return json.data;
 }
 
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * Uploads a single in-memory file buffer to Shopify Files using the
- * staged-upload flow, and returns the resulting File's GID once ready
- * to be referenced (e.g. as a metaobject "file" field value).
+ * Uploads a single in-memory photo or video buffer to Shopify Files using the
+ * staged-upload flow, and returns the resulting File's GID, ready to be
+ * referenced from a metaobject "file" field.
  *
  * Flow: stagedUploadsCreate -> POST bytes to the staged URL -> fileCreate
  */
-async function uploadImageToShopifyFiles(file) {
+async function uploadMediaToShopifyFiles(file) {
+    const isVideo = file.mimetype.startsWith("video/");
+
     // Step 1: ask Shopify for a staged upload target
     const stagedUploadsQuery = `
     mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
@@ -103,7 +165,9 @@ async function uploadImageToShopifyFiles(file) {
                 filename: file.originalname,
                 mimeType: file.mimetype,
                 httpMethod: "POST",
-                resource: "FILE"
+                // Videos use the VIDEO resource and must declare their size up front.
+                resource: isVideo ? "VIDEO" : "FILE",
+                fileSize: String(file.size)
             }
         ]
     });
@@ -148,7 +212,7 @@ async function uploadImageToShopifyFiles(file) {
         files: [
             {
                 originalSource: target.resourceUrl,
-                contentType: "IMAGE"
+                contentType: isVideo ? "VIDEO" : "IMAGE"
             }
         ]
     });
@@ -158,12 +222,49 @@ async function uploadImageToShopifyFiles(file) {
         throw new Error("fileCreate error: " + JSON.stringify(fileErrors));
     }
 
-    return fileData.fileCreate.files[0].id; // e.g. "gid://shopify/MediaImage/12345"
+    return fileData.fileCreate.files[0].id; // e.g. "gid://shopify/MediaImage/12345" or ".../Video/12345"
+}
+
+/**
+ * Videos (and large images) are processed asynchronously by Shopify. Wait
+ * briefly for the files to become READY before linking them to the review.
+ * If they are still processing after the timeout, we carry on anyway:
+ * Shopify finishes processing in the background and the files appear once ready.
+ */
+async function waitForFilesReady(fileGids, timeoutMs = 45000) {
+    const query = `
+    query FileStatuses($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on File { id fileStatus }
+      }
+    }
+  `;
+
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+        const data = await shopifyAdminGraphQL(query, { ids: fileGids });
+        const nodes = (data.nodes || []).filter(Boolean);
+
+        if (nodes.some((n) => n.fileStatus === "FAILED")) {
+            throw new Error("A review file failed processing in Shopify.");
+        }
+        if (nodes.length === fileGids.length && nodes.every((n) => n.fileStatus === "READY")) {
+            return;
+        }
+
+        await sleep(2000);
+    }
+
+    console.warn("Review files still processing after wait; continuing anyway:", fileGids);
 }
 
 /**
  * Creates the customer_reviews metaobject entry with published = false,
  * so it only appears on the storefront after an admin approves it.
+ *
+ * Requires a field with key `review_media` of type "File > List of files"
+ * on the customer_reviews metaobject definition.
  */
 async function createReviewMetaobject({
     productId,
@@ -171,7 +272,7 @@ async function createReviewMetaobject({
     location,
     rating,
     reviewText,
-    customerImageFileGid
+    mediaFileGids
 }) {
     const mutation = `
     mutation metaobjectCreate($metaobject: MetaobjectCreateInput!) {
@@ -193,8 +294,9 @@ async function createReviewMetaobject({
         { key: "published", value: "false" }
     ];
 
-    if (customerImageFileGid) {
-        fields.push({ key: "customer_image", value: customerImageFileGid });
+    if (mediaFileGids && mediaFileGids.length) {
+        // List-type fields take a JSON array of GIDs, in display order.
+        fields.push({ key: "review_media", value: JSON.stringify(mediaFileGids) });
     }
 
     const data = await shopifyAdminGraphQL(mutation, {
@@ -212,7 +314,7 @@ async function createReviewMetaobject({
     return data.metaobjectCreate.metaobject;
 }
 
-app.post("/submit-review", upload.single("customer_image"), async (req, res) => {
+app.post("/submit-review", handleReviewUpload, async (req, res) => {
     try {
         const { product_id, customer_name, location, rating, review_text } = req.body;
 
@@ -232,8 +334,6 @@ app.post("/submit-review", upload.single("customer_image"), async (req, res) => 
         }
 
         if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
-            console.log("STORE:", process.env.SHOPIFY_STORE_DOMAIN);
-            console.log("TOKEN:", process.env.SHOPIFY_ADMIN_ACCESS_TOKEN);
             console.error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN env vars");
             return res.status(500).json({
                 success: false,
@@ -241,9 +341,38 @@ app.post("/submit-review", upload.single("customer_image"), async (req, res) => 
             });
         }
 
-        let customerImageFileGid = null;
-        if (req.file) {
-            customerImageFileGid = await uploadImageToShopifyFiles(req.file);
+        // Collect photos + videos (new field first, legacy single image after)
+        const uploaded = req.files || {};
+        const files = [...(uploaded.review_media || []), ...(uploaded.customer_image || [])];
+
+        if (files.length > MAX_REVIEW_FILES) {
+            return res.status(400).json({
+                success: false,
+                message: `Too many files. You can attach up to ${MAX_REVIEW_FILES}.`
+            });
+        }
+
+        // Per-type size limits (multer only enforces the larger video cap)
+        for (const file of files) {
+            if (file.mimetype.startsWith("image/") && file.size > MAX_IMAGE_BYTES) {
+                return res.status(413).json({
+                    success: false,
+                    message: `"${file.originalname}" is too large. Photos can be up to ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB.`
+                });
+            }
+            if (file.mimetype.startsWith("video/") && file.size > MAX_VIDEO_BYTES) {
+                return res.status(413).json({
+                    success: false,
+                    message: `"${file.originalname}" is too large. Videos can be up to ${Math.round(MAX_VIDEO_BYTES / 1024 / 1024)}MB.`
+                });
+            }
+        }
+
+        let mediaFileGids = [];
+        if (files.length) {
+            // Upload in parallel; Promise.all keeps the original order.
+            mediaFileGids = await Promise.all(files.map(uploadMediaToShopifyFiles));
+            await waitForFilesReady(mediaFileGids);
         }
 
         const metaobject = await createReviewMetaobject({
@@ -252,10 +381,10 @@ app.post("/submit-review", upload.single("customer_image"), async (req, res) => 
             location,
             rating: ratingNum,
             reviewText: review_text,
-            customerImageFileGid
+            mediaFileGids
         });
 
-        console.log("Created review metaobject:", metaobject);
+        console.log("Created review metaobject:", metaobject, "media files:", mediaFileGids.length);
 
         res.json({
             success: true,
@@ -325,25 +454,25 @@ app.get("/check-delivery", async (req, res) => {
         );
 
         const srData = await srRes.json();
-const couriers = srData?.data?.available_courier_companies || [];
-if (!couriers.length) {
-    return res.json({ serviceable: false, message: "Delivery not available to this pincode" });
-}
+        const couriers = srData?.data?.available_courier_companies || [];
+        if (!couriers.length) {
+            return res.json({ serviceable: false, message: "Delivery not available to this pincode" });
+        }
 
-// Sort couriers by estimated delivery days (ascending)
-const sorted = [...couriers].sort(
-    (a, b) => parseFloat(a.estimated_delivery_days) - parseFloat(b.estimated_delivery_days)
-);
+        // Sort couriers by estimated delivery days (ascending)
+        const sorted = [...couriers].sort(
+            (a, b) => parseFloat(a.estimated_delivery_days) - parseFloat(b.estimated_delivery_days)
+        );
 
-// Pick 2nd earliest if available, else fall back to the earliest (only 1 courier serviceable)
-const chosen = sorted[1] || sorted[0];
+        // Pick 2nd earliest if available, else fall back to the earliest (only 1 courier serviceable)
+        const chosen = sorted[1] || sorted[0];
 
-res.json({
-    serviceable: true,
-    estimated_days: chosen.estimated_delivery_days,
-    cod_available: couriers.some((c) => c.cod === 1),
-    courier: chosen.courier_name
-});
+        res.json({
+            serviceable: true,
+            estimated_days: chosen.estimated_delivery_days,
+            cod_available: couriers.some((c) => c.cod === 1),
+            courier: chosen.courier_name
+        });
     } catch (err) {
         console.error("Shiprocket check-delivery error:", err);
         res.status(500).json({ error: "Could not check delivery right now" });
@@ -609,7 +738,7 @@ app.post('/track-order', async (req, res) => {
     return sendJson(res, 500, { error: 'Something went wrong. Please try again.' });
   }
 });
-// ── Wishlist sync (Shopify App Proxy) ──
+
 // ── Wishlist sync (Shopify App Proxy) ──
 function verifyProxy(req, res, next) {
     const { signature, ...rest } = req.query;
@@ -658,6 +787,7 @@ app.post("/wishlist", verifyProxy, async (req, res) => {
         res.status(500).json({ error: "Could not save wishlist" });
     }
 });
+
 app.listen(process.env.PORT || 3000, () => {
     console.log("Review API listening");
 });
